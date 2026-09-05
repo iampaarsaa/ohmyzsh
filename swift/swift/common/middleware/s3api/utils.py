@@ -1,0 +1,465 @@
+# Copyright (c) 2014 OpenStack Foundation.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#    http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
+# implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+import base64
+import calendar
+import datetime
+import email.utils
+import re
+import time
+import uuid
+
+from swift.common import utils
+from swift.common.constraints import check_utf8
+from swift.common.middleware.copy import register_copy_source_hook
+from swift.common.request_helpers import get_container_update_override_key, \
+    get_sys_meta_prefix
+from swift.common.swob import wsgi_to_str
+from swift.common.middleware.s3api.exception import \
+    InvalidBucketNameParseError, InvalidURIParseError
+from swift.common.utils import serialize_header, parse_header
+
+MULTIUPLOAD_SUFFIX = '+segments'
+
+
+def s3api_sysmeta_prefix(resource):
+    """
+    Returns the system metadata prefix for given resource type.
+
+    :param resource: one of ``'object'`` or ``'container'`` (case
+        insensitive).
+    :raises ValueError: if resource is not a recognized resource type.
+    """
+    if resource.lower() not in ('object', 'container'):
+        raise ValueError('Unknown resource type: %r' % resource)
+    return get_sys_meta_prefix(resource) + 's3api-'
+
+
+def s3api_sysmeta_header(resource, name):
+    """
+    Returns the ``s3api`` namespace system metadata header for given resource
+    type and name.
+    """
+    return s3api_sysmeta_prefix(resource) + name
+
+
+# Keep the original short spellings as backwards compatibility aliases.
+sysmeta_prefix = s3api_sysmeta_prefix
+sysmeta_header = s3api_sysmeta_header
+
+
+def is_s3api_sysmeta(server_type, name):
+    return name.lower().startswith(
+        get_sys_meta_prefix(server_type) + 's3api-')
+
+
+def swift3_object_sysmeta_header(name):
+    """
+    Returns the legacy ``swift3`` namespace object system metadata header for
+    the given name.
+    """
+    return get_sys_meta_prefix('object') + 'swift3-' + name
+
+
+def is_swift3_sysmeta(server_type, name):
+    return name.lower().startswith(
+        get_sys_meta_prefix(server_type) + 'swift3-')
+
+
+def is_swift3_object_sysmeta(name):
+    return is_swift3_sysmeta('object', name)
+
+
+def camel_to_snake(camel):
+    return re.sub('([A-Z])', r'_\1', camel).lstrip('_').lower()
+
+
+def snake_to_camel(snake):
+    return snake.title().replace('_', '')
+
+
+def make_header_label(header):
+    return 'header_' + header.lower().replace('-', '_')
+
+
+def unique_id():
+    result = base64.urlsafe_b64encode(str(uuid.uuid4()).encode('ascii'))
+    return result.decode('ascii')
+
+
+def utf8encode(s):
+    if s is None or isinstance(s, bytes):
+        return s
+    return s.encode('utf8')
+
+
+def utf8decode(s):
+    if isinstance(s, bytes):
+        s = s.decode('utf8')
+    return s
+
+
+def is_valid_base64(s):
+    try:
+        base64.b64decode(s)
+        return True
+    except Exception:
+        return False
+
+
+def is_valid_hash(hash_string):
+    try:
+        int(hash_string, 16)
+    except ValueError:
+        return False
+    return True
+
+
+def classify_checksum_header_value(value):
+    if is_valid_hash(value):
+        if len(value) in (8, 16, 20, 32, 64, 128, 256, 512):
+            return 'hash_%d' % len(value)
+    elif is_valid_base64(value):
+        # crc32 -> b64_8
+        # crc64 -> b64_12
+        # md5 -> b64_24
+        # sha1 -> b64_28
+        # sha256 -> b64_44
+        if len(value) in (8, 12, 24, 28, 44):
+            return 'b64_%d' % len(value)
+    return 'unknown'
+
+
+def validate_bucket_name(name, dns_compliant_bucket_names):
+    """
+    Validates the name of the bucket against S3 criteria,
+    http://docs.amazonwebservices.com/AmazonS3/latest/BucketRestrictions.html
+    True is valid, False is invalid.
+    """
+    valid_chars = '-.a-z0-9'
+    if not dns_compliant_bucket_names:
+        valid_chars += 'A-Z_'
+    max_len = 63 if dns_compliant_bucket_names else 255
+
+    if len(name) < 3 or len(name) > max_len or not name[0].isalnum():
+        # Bucket names should be between 3 and 63 (or 255) characters long
+        # Bucket names must start with a letter or a number
+        return False
+    elif dns_compliant_bucket_names and (
+            '.-' in name or '-.' in name or '..' in name or
+            not name[-1].isalnum()):
+        # Bucket names cannot contain dashes next to periods
+        # Bucket names cannot contain two adjacent periods
+        # Bucket names must end with a letter or a number
+        return False
+    elif name.endswith('.'):
+        # Bucket names must not end with dot
+        return False
+    elif re.match(r"^(([0-9]|[1-9][0-9]|1[0-9]{2}|2[0-4][0-9]|25[0-5])\.)"
+                  r"{3}([0-9]|[1-9][0-9]|1[0-9]{2}|2[0-4][0-9]|25[0-5])$",
+                  name):
+        # Bucket names cannot be formatted as an IP Address
+        return False
+    elif not re.match("^[%s]*$" % valid_chars, name):
+        # Bucket names can contain lowercase letters, numbers, and hyphens.
+        return False
+    else:
+        return True
+
+
+def get_s3_access_key_id(req):
+    """
+    Return the S3 access_key_id user for the request,
+    or None if it does not look like an S3 request.
+
+    :param req: a swob.Request instance
+
+    :returns: access_key_id if available, else None
+    """
+
+    authorization = req.headers.get('Authorization', '')
+    if authorization.startswith('AWS '):
+        # v2
+        return authorization[4:].rsplit(':', 1)[0]
+    if authorization.startswith('AWS4-HMAC-SHA256 '):
+        # v4
+        return authorization.partition('Credential=')[2].split('/', 1)[0]
+    params = req.params
+    if 'AWSAccessKeyId' in params:
+        # v2
+        return params['AWSAccessKeyId']
+    if 'X-Amz-Credential' in params:
+        # v4
+        return params['X-Amz-Credential'].split('/', 1)[0]
+
+    return None
+
+
+def is_s3_req(req):
+    """
+    Check whether a request looks like it ought to be an S3 request.
+
+    :param req: a swob.Request instance
+
+    :returns: True if access_key_id is available, False if not
+    """
+    return bool(get_s3_access_key_id(req))
+
+
+def parse_host(environ, storage_domains):
+    """
+    A bucket-in-host request has the bucket name as the first part of a
+    ``.``-separated host. If the host ends with any of
+    the given storage_domains then the bucket name is returned.
+    Otherwise ``None`` is returned.
+
+    :param environ: an environment dict
+    :param storage_domains: a list of storage domains for which bucket-in-host
+                            is supported.
+    :returns: bucket name or None
+    """
+
+    if 'HTTP_HOST' in environ:
+        given_domain = environ['HTTP_HOST']
+    elif 'SERVER_NAME' in environ:
+        given_domain = environ['SERVER_NAME']
+    else:
+        return None
+    if ':' in given_domain:
+        given_domain = given_domain.rsplit(':', 1)[0]
+
+    for storage_domain in storage_domains:
+        if not storage_domain.startswith('.'):
+            storage_domain = '.' + storage_domain
+
+        if given_domain.endswith(storage_domain):
+            return given_domain[:-len(storage_domain)]
+
+    return None
+
+
+def parse_path(req, bucket_in_host, dns_compliant_bucket_names):
+    """
+    :params req: a swob.Request instance
+    :params bucket_in_host: A bucket-in-host request has the bucket name as
+                            the first part of a ``.``-separated host.
+    :params dns_compliant_bucket_names: whether to validate that the bucket
+                                        name must be dns compliant
+
+    :returns: WSGI string
+    """
+    if not check_utf8(wsgi_to_str(req.environ['PATH_INFO'])):
+        raise InvalidURIParseError(req.path)
+
+    if bucket_in_host:
+        obj = req.environ['PATH_INFO'][1:] or None
+        return bucket_in_host, obj
+
+    bucket, obj = req.split_path(0, 2, True)
+
+    if bucket and not validate_bucket_name(
+            bucket, dns_compliant_bucket_names):
+        # Ignore GET service case
+        raise InvalidBucketNameParseError(bucket)
+    return bucket, obj
+
+
+def extract_bucket_and_key(req, storage_domains,
+                           dns_compliant_bucket_names):
+    """
+    Extract the bucket and object key from the request's PATH_INFO. Support
+    bucket-in-host if storage_domains and HTTP_HOST or SERVER_NAME are
+    specified. Otherwise the bucket is parsed from PATH_INFO.
+
+    :param req: a swob.Request instance
+    :param storage_domains: a list of storage domains for which bucket-in-host
+                            is supported.
+    :param dns_compliant_bucket_names: whether to validate that the bucket
+                                       name must be dns compliant
+
+    :returns: a tuple of (bucket, key). If the request path is invalid
+              the tuple (None, None) is returned.
+    """
+    try:
+        bucket_in_host = parse_host(req.environ, storage_domains)
+        bucket, key = parse_path(
+            req, bucket_in_host, dns_compliant_bucket_names)
+    except (InvalidBucketNameParseError, InvalidURIParseError):
+        bucket, key = None, None
+    return bucket, key
+
+
+def get_swift_to_s3_cipher_mappings():
+    """
+    Get the known Swift to S3 cipher mappings.
+    :returns: a list of known mappings
+    """
+
+    # Obtained from Amazon S3's ServerSideEncryptionByDefault docs.
+    # AES_CTR_256 is the only one Swift supports as of now
+    return {
+        'AES_CTR_256': 'AES256',
+    }
+
+
+def convert_swift_to_s3_cipher(cipher):
+    """
+    Convert a cipher used in Swift to the cipher used in S3.
+    :param: cipher: the cipher used in Swift
+    :returns: the cipher used in S3
+    """
+
+    mappings = get_swift_to_s3_cipher_mappings()
+    if cipher in mappings:
+        return mappings[cipher]
+    return None
+
+
+class S3Timestamp(utils.Timestamp):
+    S3_XML_FORMAT = "%Y-%m-%dT%H:%M:%S.000Z"
+
+    @property
+    def s3xmlformat(self):
+        dt = datetime.datetime.fromtimestamp(
+            self.ceil(), datetime.timezone.utc)
+        return dt.strftime(self.S3_XML_FORMAT)
+
+    @classmethod
+    def from_s3xmlformat(cls, date_string):
+        dt = datetime.datetime.strptime(date_string, cls.S3_XML_FORMAT)
+        dt = dt.replace(tzinfo=datetime.timezone.utc)
+        seconds = calendar.timegm(dt.timetuple())
+        return cls(seconds)
+
+    @property
+    def amz_date_format(self):
+        """
+        this format should be like 'YYYYMMDDThhmmssZ'
+        """
+        return self.isoformat.replace(
+            '-', '').replace(':', '')[:-7] + 'Z'
+
+
+def mktime(timestamp_str, time_format='%Y-%m-%dT%H:%M:%S'):
+    """
+    mktime creates a float instance in epoch time really like as time.mktime
+
+    the difference from time.mktime is allowing to 2 formats string for the
+    argument for the S3 testing usage.
+    TODO: support
+
+    :param timestamp_str: a string of timestamp formatted as
+                          (a) RFC2822 (e.g. date header)
+                          (b) %Y-%m-%dT%H:%M:%S (e.g. copy result)
+    :param time_format: a string of format to parse in (b) process
+    :returns: a float instance in epoch time
+    """
+    # time_tuple is the *remote* local time
+    time_tuple = email.utils.parsedate_tz(timestamp_str)
+    if time_tuple is None:
+        time_tuple = time.strptime(timestamp_str, time_format)
+        # add timezone info as utc (no time difference)
+        time_tuple += (0, )
+
+    # We prefer calendar.gmtime and a manual adjustment over
+    # email.utils.mktime_tz because older versions of Python (<2.7.4) may
+    # double-adjust for timezone in some situations (such when swift changes
+    # os.environ['TZ'] without calling time.tzset()).
+    epoch_time = calendar.timegm(time_tuple) - time_tuple[9]
+
+    return epoch_time
+
+
+class Config(dict):
+    DEFAULTS = {
+        'storage_domains': [],
+        'location': 'us-east-1',
+        'force_swift_request_proxy_log': False,
+        'dns_compliant_bucket_names': True,
+        'allow_multipart_uploads': True,
+        'allow_no_owner': False,
+        'allowable_clock_skew': 900,
+        'ratelimit_as_client_error': False,
+        'max_upload_part_num': 1000,
+    }
+
+    def __init__(self, base=None):
+        self.update(self.DEFAULTS)
+        if base is not None:
+            self.update(base)
+
+    def __getattr__(self, name):
+        if name not in self:
+            raise AttributeError("No attribute '%s'" % name)
+
+        return self[name]
+
+    def __setattr__(self, name, value):
+        self[name] = value
+
+    def __delattr__(self, name):
+        del self[name]
+
+    def update(self, other):
+        if hasattr(other, 'keys'):
+            for key in other.keys():
+                self[key] = other[key]
+        else:
+            for key, value in other:
+                self[key] = value
+
+    def __setitem__(self, key, value):
+        if isinstance(self.get(key), bool):
+            dict.__setitem__(self, key, utils.config_true_value(value))
+        elif isinstance(self.get(key), int):
+            try:
+                dict.__setitem__(self, key, int(value))
+            except ValueError:
+                if value:  # No need to raise the error if value is ''
+                    raise
+        else:
+            dict.__setitem__(self, key, value)
+
+
+def install_copy_hook(environ):
+    def copy_hook(req, source_resp, sink_req):
+        # copy middleware has already copied most sysmeta from the source resp
+        # to the sink req, so first clear *all* s3api sysmeta, and then set
+        # only the s3api sysmeta that is explicitly wanted in sink_req...
+        etag_override_key = get_container_update_override_key('etag').lower()
+        is_s3_mpu = s3api_sysmeta_header(
+            'object', 'upload-id') in sink_req.headers
+        for key, value in dict(sink_req.headers).items():
+            lower_key = key.lower()
+            if (is_s3api_sysmeta('object', lower_key)
+                    or is_swift3_object_sysmeta(lower_key)):
+                del sink_req.headers[key]
+            elif is_s3_mpu and lower_key in ('x-object-sysmeta-slo-etag',
+                                             'x-object-sysmeta-slo-size'):
+                # s3api assumes responsibility for the SLO sysmeta for an MPU
+                del sink_req.headers[key]
+            elif lower_key == etag_override_key:
+                etag, params = parse_header(value)
+                params.pop('s3_etag', None)
+                value = serialize_header(etag, params)
+                sink_req.headers[key] = value or None
+            # else: not relevant to s3api
+
+        # acl sysmeta from the req takes precedence over any from the source
+        acl_header = s3api_sysmeta_header('object', 'acl')
+        sink_req.headers[acl_header] = (req.headers.get(acl_header)
+                                        or source_resp.headers.get(acl_header))
+
+    register_copy_source_hook(environ, copy_hook)
